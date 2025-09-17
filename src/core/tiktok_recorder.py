@@ -1,5 +1,7 @@
 import os
 import time
+import subprocess
+
 from http.client import HTTPException
 from multiprocessing import Process
 
@@ -101,6 +103,16 @@ class TikTokRecorder:
 
         elif self.mode == Mode.FOLLOWERS:
             self.followers_mode()
+
+
+def notify(title, content, ongoing=False):
+    try:
+        cmd = ["termux-notification", "--title", title, "--content", content]
+        if ongoing:
+            cmd += ["--ongoing", "true"]
+        subprocess.run(cmd, check=False)
+    except Exception:
+        pass
 
     def manual_mode(self):
         if not self.tiktok.is_room_alive(self.room_id):
@@ -208,11 +220,13 @@ class TikTokRecorder:
                     self.output = self.output + "/"
 
         output = f"{self.output if self.output else ''}TK_{user}_{current_date}_flv.mp4"
+if self.duration:
+    logger.info(f"Started recording for {self.duration} seconds ")
+    notify("TikTok Recorder", f"Recording {self.user} for {self.duration}s", ongoing=True)
+else:
+    logger.info("Started recording...")
+    notify("TikTok Recorder", f"Recording {self.user}", ongoing=True)
 
-        if self.duration:
-            logger.info(f"Started recording for {self.duration} seconds ")
-        else:
-            logger.info("Started recording...")
 
         buffer_size = 512 * 1024  # 512 KB buffer
         buffer = bytearray()
@@ -261,6 +275,8 @@ class TikTokRecorder:
                     out_file.flush()
 
         logger.info(f"Recording finished: {output}\n")
+notify("TikTok Recorder", f"Finished recording {self.user}", ongoing=False)
+
         VideoManagement.convert_flv_to_mp4(output)
 
         if self.use_telegram:
