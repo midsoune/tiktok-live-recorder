@@ -12,7 +12,24 @@ from upload.telegram import Telegram
 from utils.custom_exceptions import LiveNotFound, UserLiveError, TikTokRecorderError
 from utils.enums import Mode, Error, TimeOut, TikTokError
 
+def record_with_ffmpeg(live_url, output, duration=None):
+    try:
+        cmd = [
+            "ffmpeg",
+            "-y",               # overwrite output if exists
+            "-i", live_url,     # live stream url
+            "-c", "copy",       # copy without re-encoding
+            "-f", "mp4",        # force mp4 container
+            output
+        ]
+        if duration:
+            cmd.insert(1, "-t")
+            cmd.insert(2, str(duration))  # duration in seconds
 
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        print(f"FFmpeg error: {e}")
+        
 def notify(title, content, ongoing=False):
     """إرسال إشعار في Termux"""
     try:
@@ -131,68 +148,29 @@ class TikTokRecorder:
             except Exception as ex:
                 logger.error(f"Unexpected error: {ex}\n")
 
-    def start_recording(self, user, room_id):
-        live_url = self.tiktok.get_live_url(room_id)
-        if not live_url:
-            raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
+def start_recording(self, user, room_id):
+    live_url = self.tiktok.get_live_url(room_id)
+    if not live_url:
+        raise LiveNotFound("Could not retrieve live URL")
 
-        current_date = time.strftime("%Y.%m.%d_%H-%M-%S", time.localtime())
-        if self.output and not (self.output.endswith("/") or self.output.endswith("\\")):
-            self.output += "\\" if os.name == "nt" else "/"
-        output = f"{self.output if self.output else ''}TK_{user}_{current_date}_flv.mp4"
+    current_date = time.strftime("%Y.%m.%d_%H-%M-%S", time.localtime())
+    output = f"{self.output if self.output else ''}TK_{user}_{current_date}.mp4"
 
-        if self.duration:
-            logger.info(f"Started recording for {self.duration} seconds ")
-            notify("TikTok Recorder", f"Recording {self.user} for {self.duration}s", ongoing=True)
-        else:
-            logger.info("Started recording...")
-            notify("TikTok Recorder", f"Recording {self.user}", ongoing=True)
+    logger.info(f"Recording @{user} with FFmpeg...")
 
-        buffer_size = 512 * 1024
-        buffer = bytearray()
-        logger.info("[PRESS CTRL + C ONCE TO STOP]")
+    if self.duration:
+        notify("TikTok Recorder", f"Recording {self.user} for {self.duration}s", ongoing=True)
+        record_with_ffmpeg(live_url, output, self.duration)
+    else:
+        notify("TikTok Recorder", f"Recording {self.user}", ongoing=True)
+        record_with_ffmpeg(live_url, output)
 
-        with open(output, "wb") as out_file:
-            stop_recording = False
-            while not stop_recording:
-                try:
-                    if not self.tiktok.is_room_alive(room_id):
-                        logger.info("User is no longer live. Stopping recording.")
-                        break
-                    start_time = time.time()
-                    for chunk in self.tiktok.download_live_stream(live_url):
-                        buffer.extend(chunk)
-                        if len(buffer) >= buffer_size:
-                            out_file.write(buffer)
-                            buffer.clear()
-                        elapsed_time = time.time() - start_time
-                        if self.duration and elapsed_time >= self.duration:
-                            stop_recording = True
-                            break
-                except ConnectionError:
-                    if self.mode == Mode.AUTOMATIC:
-                        logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
-                        time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
-                except (RequestException, HTTPException):
-                    time.sleep(2)
-                except KeyboardInterrupt:
-                    logger.info("Recording stopped by user.")
-                    stop_recording = True
-                except Exception as ex:
-                    logger.error(f"Unexpected error: {ex}\n")
-                    stop_recording = True
-                finally:
-                    if buffer:
-                        out_file.write(buffer)
-                        buffer.clear()
-                    out_file.flush()
+    logger.info(f"Recording finished: {output}")
+    notify("TikTok Recorder", f"Finished recording {self.user}", ongoing=False)
 
-        logger.info(f"Recording finished: {output}\n")
-        notify("TikTok Recorder", f"Finished recording {self.user}", ongoing=False)
-        VideoManagement.convert_flv_to_mp4(output)
+    if self.use_telegram:
+        Telegram().upload(output)
 
-        if self.use_telegram:
-            Telegram().upload(output.replace("_flv.mp4", ".mp4"))
 
     def check_country_blacklisted(self):
         is_blacklisted = self.tiktok.is_country_blacklisted()
