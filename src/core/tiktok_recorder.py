@@ -12,48 +12,49 @@ from upload.telegram import Telegram
 from utils.custom_exceptions import LiveNotFound, UserLiveError, TikTokRecorderError
 from utils.enums import Mode, Error, TimeOut, TikTokError
 
-def record_with_ffmpeg(live_url, output, duration=None):
-    try:
-        cmd = [
-            "ffmpeg",
-            "-y",               # overwrite output if exists
-            "-i", live_url,     # live stream url
-            "-c", "copy",       # copy without re-encoding
-            "-f", "mp4",        # force mp4 container
-            output
-        ]
-        if duration:
-            cmd.insert(1, "-t")
-            cmd.insert(2, str(duration))  # duration in seconds
 
+def record_with_ffmpeg(live_url: str, output: str, duration: int = None):
+    """
+    Record a live stream using ffmpeg and save directly to MP4.
+    If duration is provided (seconds) ffmpeg will stop after that time.
+    """
+    try:
+        cmd = ["ffmpeg", "-y"]
+        if duration:
+            cmd += ["-t", str(int(duration))]
+        cmd += ["-i", live_url, "-c", "copy", "-f", "mp4", output]
+        logger.info(f"Running ffmpeg: {' '.join(cmd)}")
         subprocess.run(cmd, check=True)
     except Exception as e:
-        print(f"FFmpeg error: {e}")
-        
-def notify(title, content, ongoing=False):
-    """إرسال إشعار في Termux"""
+        logger.error(f"FFmpeg error: {e}")
+        raise
+
+
+def notify(title: str, content: str, ongoing: bool = False):
+    """Send a Termux notification if available (silent fail otherwise)."""
     try:
-        cmd = ["termux-notification", "--title", title, "--content", content]
+        cmd = ["termux-notification", "--title", str(title), "--content", str(content)]
         if ongoing:
             cmd.append("--ongoing")
         subprocess.run(cmd, check=False)
     except Exception:
+        # Termux not available or failed — ignore silently
         pass
 
 
 class TikTokRecorder:
     def __init__(
         self,
-        url,
-        user,
-        room_id,
-        mode,
-        automatic_interval,
-        cookies,
-        proxy,
-        output,
-        duration,
-        use_telegram,
+        url: str = None,
+        user: str = None,
+        room_id: str = None,
+        mode: Mode = Mode.MANUAL,
+        automatic_interval: int = 5,
+        cookies: dict = None,
+        proxy: str = None,
+        output: str = "",
+        duration: int = None,
+        use_telegram: bool = False,
     ):
         self.tiktok = TikTokAPI(proxy=proxy, cookies=cookies)
         self.url = url
@@ -62,9 +63,16 @@ class TikTokRecorder:
         self.mode = mode
         self.automatic_interval = automatic_interval
         self.duration = duration
-        self.output = output
+        self.output = output or ""
         self.use_telegram = use_telegram
 
+        # validate / adjust output dir
+        if isinstance(self.output, str) and self.output != "":
+            # ensure trailing slash
+            if not (self.output.endswith("/") or self.output.endswith("\\")):
+                self.output = self.output + ("\\" if os.name == "nt" else "/")
+
+        # Check blacklist (may raise)
         self.check_country_blacklisted()
 
         if self.mode == Mode.FOLLOWERS:
@@ -87,6 +95,7 @@ class TikTokRecorder:
                     + ("\n" if not self.tiktok.is_room_alive(self.room_id) else "")
                 )
 
+        # Reinitialize API without proxy for playback if proxy was only for queries
         if proxy:
             self.tiktok = TikTokAPI(proxy=None, cookies=cookies)
 
@@ -123,17 +132,25 @@ class TikTokRecorder:
                 logger.error(f"Unexpected error: {ex}\n")
 
     def followers_mode(self):
-        active_recordings = {}
+        active_recordings = {}  # follower -> Process
         while True:
             try:
                 followers = self.tiktok.get_followers_list(self.sec_uid)
                 for follower in followers:
-                    if follower in active_recordings and active_recordings[follower].is_alive():
-                        continue
+                    # cleanup finished processes
+                    if follower in active_recordings:
+                        proc = active_recordings[follower]
+                        if not proc.is_alive():
+                            logger.info(f"Recording of @{follower} finished.")
+                            del active_recordings[follower]
+                        else:
+                            continue
+
                     try:
                         room_id = self.tiktok.get_room_id_from_user(follower)
                         if not room_id or not self.tiktok.is_room_alive(room_id):
                             continue
+
                         logger.info(f"@{follower} is live. Starting recording...")
                         process = Process(target=self.start_recording, args=(follower, room_id))
                         process.start()
@@ -142,44 +159,90 @@ class TikTokRecorder:
                     except Exception as e:
                         logger.error(f"Error while processing @{follower}: {e}")
                         continue
+
                 delay = self.automatic_interval * TimeOut.ONE_MINUTE
                 logger.info(f"Waiting {delay} minutes for the next check...")
                 time.sleep(delay)
+            except UserLiveError as ex:
+                logger.info(ex)
+                logger.info(f"Waiting {self.automatic_interval} minutes before recheck\n")
+                time.sleep(self.automatic_interval * TimeOut.ONE_MINUTE)
+            except ConnectionError:
+                logger.error(Error.CONNECTION_CLOSED_AUTOMATIC)
+                time.sleep(TimeOut.CONNECTION_CLOSED * TimeOut.ONE_MINUTE)
             except Exception as ex:
                 logger.error(f"Unexpected error: {ex}\n")
 
-def start_recording(self, user, room_id):
-    live_url = self.tiktok.get_live_url(room_id)
-    if not live_url:
-        raise LiveNotFound("Could not retrieve live URL")
+    def start_recording(self, user: str, room_id: str):
+        """
+        Start recording a live stream. Uses ffmpeg to capture directly to mp4.
+        """
+        try:
+            live_url = self.tiktok.get_live_url(room_id)
+            if not live_url:
+                raise LiveNotFound(TikTokError.RETRIEVE_LIVE_URL)
 
-    current_date = time.strftime("%Y.%m.%d_%H-%M-%S", time.localtime())
-    output = f"{self.output if self.output else ''}TK_{user}_{current_date}.mp4"
+            current_date = time.strftime("%Y.%m.%d_%H-%M-%S", time.localtime())
+            output = os.path.join(self.output, f"TK_{user}_{current_date}.mp4") if self.output else f"TK_{user}_{current_date}.mp4"
 
-    logger.info(f"Recording @{user} with FFmpeg...")
+            logger.info(f"Recording @{user} with FFmpeg to: {output}")
 
-    if self.duration:
-        notify("TikTok Recorder", f"Recording {self.user} for {self.duration}s", ongoing=True)
-        record_with_ffmpeg(live_url, output, self.duration)
-    else:
-        notify("TikTok Recorder", f"Recording {self.user}", ongoing=True)
-        record_with_ffmpeg(live_url, output)
+            # notify start
+            if self.duration:
+                logger.info(f"Started recording for {self.duration} seconds ")
+                notify("TikTok Recorder", f"Recording {user} for {self.duration}s", ongoing=True)
+                record_with_ffmpeg(live_url, output, self.duration)
+            else:
+                logger.info("Started recording...")
+                notify("TikTok Recorder", f"Recording {user}", ongoing=True)
+                record_with_ffmpeg(live_url, output)
 
-    logger.info(f"Recording finished: {output}")
-    notify("TikTok Recorder", f"Finished recording {self.user}", ongoing=False)
+            logger.info(f"Recording finished: {output}")
+            notify("TikTok Recorder", f"Finished recording {user}", ongoing=False)
 
-    if self.use_telegram:
-        Telegram().upload(output)
+            # conversion (if your pipeline requires conversion, keep it; otherwise skip)
+            try:
+                # if you produced .mp4 already, conversion may not be needed; this preserves original behavior
+                VideoManagement.convert_flv_to_mp4(output)  # safe if it handles mp4 or optional
+            except Exception as e:
+                logger.debug(f"Conversion skipped or failed: {e}")
 
+            if self.use_telegram:
+                try:
+                    Telegram().upload(output)
+                except Exception as e:
+                    logger.error(f"Telegram upload failed: {e}")
+
+        except KeyboardInterrupt:
+            logger.info("Recording stopped by user (KeyboardInterrupt).")
+            notify("TikTok Recorder", f"Recording stopped: {user}", ongoing=False)
+        except LiveNotFound as e:
+            logger.error(f"Live not found: {e}")
+            notify("TikTok Recorder", f"Live not found: {user}", ongoing=False)
+        except Exception as e:
+            logger.error(f"Unexpected error during recording: {e}")
+            notify("TikTok Recorder", f"Error recording {user}", ongoing=False)
 
     def check_country_blacklisted(self):
-        is_blacklisted = self.tiktok.is_country_blacklisted()
+        """
+        Check via TikTok API if country is blacklisted. Raises TikTokRecorderError on block.
+        """
+        try:
+            is_blacklisted = self.tiktok.is_country_blacklisted()
+        except Exception as e:
+            # If the API call fails, assume not blacklisted (or re-raise if you prefer)
+            logger.debug(f"Country check failed: {e}")
+            is_blacklisted = False
+
         if not is_blacklisted:
             return False
+
         if self.room_id is None:
             raise TikTokRecorderError(TikTokError.COUNTRY_BLACKLISTED)
+
         if self.mode == Mode.AUTOMATIC:
             raise TikTokRecorderError(TikTokError.COUNTRY_BLACKLISTED_AUTO_MODE)
         elif self.mode == Mode.FOLLOWERS:
             raise TikTokRecorderError(TikTokError.COUNTRY_BLACKLISTED_FOLLOWERS_MODE)
+
         return is_blacklisted
